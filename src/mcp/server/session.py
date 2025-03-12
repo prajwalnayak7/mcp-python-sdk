@@ -37,6 +37,7 @@ The ServerSession class is typically used internally by the Server class and sho
 be instantiated directly by users of the MCP framework.
 """
 
+import time
 from enum import Enum
 from typing import Any
 
@@ -176,6 +177,25 @@ class ServerSession(
                 )
             )
         )
+
+    async def check_long_running_process(self, start_time: float, request_id: types.RequestId) -> None:
+        """Check if a process has been running for more than 10 seconds and send a notification.
+
+        Args:
+            start_time: Unix timestamp when the process started
+            request_id: The ID of the request being monitored
+
+        This method sends a warning notification if the process has been running for
+        more than 10 seconds, informing the user they can cancel it using the stop button.
+        """
+        current_time = time.time()
+        if current_time - start_time >= 10.0:
+            await self.send_log_message(
+                types.LoggingLevel.WARNING,
+                f"Process with request ID {request_id} has been running for more than 10 seconds. "
+                "You can cancel it using the stop button.",
+                "process_monitor"
+            )
 
     async def send_resource_updated(self, uri: AnyUrl) -> None:
         """Send a resource updated notification."""

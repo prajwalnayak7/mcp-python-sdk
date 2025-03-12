@@ -64,8 +64,10 @@ notifications. It automatically manages the request context and handles incoming
 messages from the client.
 """
 
+import asyncio
 import contextvars
 import logging
+import time
 import warnings
 from collections.abc import Awaitable, Callable, Iterable
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager
@@ -122,8 +124,9 @@ async def lifespan(server: "Server") -> AsyncIterator[object]:
 class Server(Generic[LifespanResultT]):
     def __init__(
         self,
-        name: str,
+        name: str = "mcp-server",
         version: str | None = None,
+        capabilities: types.ServerCapabilities | None = None,
         instructions: str | None = None,
         lifespan: Callable[
             ["Server"], AbstractAsyncContextManager[LifespanResultT]
@@ -131,6 +134,7 @@ class Server(Generic[LifespanResultT]):
     ):
         self.name = name
         self.version = version
+        self.capabilities = capabilities or types.ServerCapabilities()
         self.instructions = instructions
         self.lifespan = lifespan
         self.request_handlers: dict[
@@ -139,6 +143,7 @@ class Server(Generic[LifespanResultT]):
             types.PingRequest: _ping_handler,
         }
         self.notification_handlers: dict[type, Callable[..., Awaitable[None]]] = {}
+        self.running_tools: dict[str | int, asyncio.Task] = {}  # Track running tool tasks
         self.notification_options = NotificationOptions()
         logger.debug(f"Initializing server '{name}'")
 
@@ -515,7 +520,11 @@ class Server(Generic[LifespanResultT]):
                 ):
                     with responder:
                         await self._handle_request(
-                            message, req, session, lifespan_context, raise_exceptions
+                            responder,
+                            req,
+                            session,
+                            lifespan_context,
+                            raise_exceptions,
                         )
                 case types.ClientNotification(root=notify):
                     await self._handle_notification(notify)
@@ -524,54 +533,59 @@ class Server(Generic[LifespanResultT]):
                 logger.info(f"Warning: {warning.category.__name__}: {warning.message}")
 
     async def _handle_request(
-        self,
-        message: RequestResponder,
-        req: Any,
-        session: ServerSession,
-        lifespan_context: LifespanResultT,
-        raise_exceptions: bool,
-    ):
-        logger.info(f"Processing request of type {type(req).__name__}")
-        if type(req) in self.request_handlers:
-            handler = self.request_handlers[type(req)]
-            logger.debug(f"Dispatching request of type {type(req).__name__}")
+        self, responder: RequestResponder[types.ServerRequest, types.ServerResult], request: Any, session: ServerSession, lifespan_context: LifespanResultT, raise_exceptions: bool):
+        """Handle an incoming request."""
+        request_type = type(request)
 
-            token = None
-            try:
-                # Set our global state that can be retrieved via
-                # app.get_request_context()
-                token = request_ctx.set(
-                    RequestContext(
-                        message.request_id,
-                        message.request_meta,
-                        session,
-                        lifespan_context,
+        if request_type not in self.request_handlers:
+            with responder:
+                await responder.respond_with_error(
+                    types.ErrorData(
+                        code=-32601,
+                        message=f"Method not found: {request.method}",
                     )
                 )
-                response = await handler(req)
-            except McpError as err:
-                response = err.error
-            except Exception as err:
-                if raise_exceptions:
-                    raise err
-                response = types.ErrorData(code=0, message=str(err), data=None)
-            finally:
-                # Reset the global state after we are done
-                if token is not None:
-                    request_ctx.reset(token)
+            return
 
-            await message.respond(response)
-        else:
-            await message.respond(
-                types.ErrorData(
-                    code=types.METHOD_NOT_FOUND,
-                    message="Method not found",
+        handler = self.request_handlers[request_type]
+        logger.debug(f"Dispatching request of type {request_type.__name__}")
+
+        try:
+            if isinstance(request, types.CallToolRequest):
+                # Use cancellation-aware tool runner for tool requests
+                result = await self._run_tool(
+                    responder.request.id,
+                    handler,
+                    request,
                 )
-            )
+            else:
+                result = await handler(request)
 
-        logger.debug("Response sent")
+            with responder:
+                await responder.respond(result)
+        except McpError as err:
+            with responder:
+                await responder.respond_with_error(
+                    types.ErrorData(
+                        code=err.code if hasattr(err, "code") else -32000,
+                        message=str(err),
+                    )
+                )
+        except Exception as err:
+            logger.error(f"Uncaught exception in request handler: {err}")
+            with responder:
+                await responder.respond_with_error(
+                    types.ErrorData(
+                        code=-32000,
+                        message=str(err),
+                    )
+                )
 
     async def _handle_notification(self, notify: Any):
+        if isinstance(notify, types.CancelledNotification):
+            await self._handle_tool_cancellation(notify.params.requestId)
+            return
+
         if type(notify) in self.notification_handlers:
             assert type(notify) in self.notification_handlers
 
@@ -584,6 +598,84 @@ class Server(Generic[LifespanResultT]):
                 await handler(notify)
             except Exception as err:
                 logger.error(f"Uncaught exception in notification handler: " f"{err}")
+
+    async def _handle_tool_cancellation(self, request_id: types.RequestId) -> None:
+        """Handle cancellation of a running tool.
+
+        Args:
+            request_id: The ID of the request to cancel
+
+        This method attempts to cancel a running tool task and clean up associated resources.
+        It will log success or failure of the cancellation attempt.
+        """
+        if request_id in self.running_tools:
+            task = self.running_tools[request_id]
+            try:
+                task.cancel()
+                await task
+            except asyncio.CancelledError:
+                logger.info(f"Tool task {request_id} was cancelled")
+            except Exception as e:
+                logger.error(f"Error while cancelling tool task {request_id}: {e}")
+            finally:
+                del self.running_tools[request_id]
+
+    async def _run_tool(
+        self,
+        request_id: types.RequestId,
+        tool_func: Callable[..., Awaitable[types.ServerResult]],
+        *args: Any,
+        **kwargs: Any,
+    ) -> types.ServerResult:
+        """Run a tool with cancellation support.
+
+        Args:
+            request_id: The ID of the request being executed
+            tool_func: The tool function to run
+            *args: Positional arguments to pass to the tool function
+            **kwargs: Keyword arguments to pass to the tool function
+
+        Returns:
+            The result from the tool function
+
+        Raises:
+            McpError: If the tool execution is cancelled
+            Exception: If the tool execution fails for any other reason
+
+        This method wraps tool execution with cancellation support and long-running process
+        detection. It will:
+        1. Track the tool task for potential cancellation
+        2. Monitor execution duration and notify if it exceeds 10 seconds
+        3. Clean up resources when the tool completes or is cancelled
+        """
+        import time
+        start_time = time.time()
+        
+        try:
+            task = asyncio.create_task(tool_func(*args, **kwargs))
+            self.running_tools[request_id] = task
+            
+            # Check for long-running process after 10 seconds
+            async def check_duration() -> None:
+                await asyncio.sleep(10)
+                if request_id in self.running_tools:
+                    session = request_ctx.get().session
+                    await session.check_long_running_process(start_time, request_id)
+            
+            duration_check = asyncio.create_task(check_duration())
+            
+            try:
+                result = await task
+                return result
+            except asyncio.CancelledError:
+                raise McpError("Tool execution was cancelled")
+            finally:
+                duration_check.cancel()
+                if request_id in self.running_tools:
+                    del self.running_tools[request_id]
+        except Exception as e:
+            logger.error(f"Error running tool {request_id}: {e}")
+            raise
 
 
 async def _ping_handler(request: types.PingRequest) -> types.ServerResult:
